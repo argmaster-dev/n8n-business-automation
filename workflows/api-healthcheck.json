@@ -1,0 +1,161 @@
+{
+  "name": "Здоровье API",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "name": "Каждые 5 минут",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "p0",
+              "name": "chat_id",
+              "value": "={{ $env.TELEGRAM_CHAT_ID || 'REPLACE_CHAT_ID' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Параметры",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "ЗАМЕНИТЬ ПРИ ИМПОРТЕ: chat_id — твой личный чат с ботом (узнать: написать боту, затем GET https://api.telegram.org/bot<token>/getUpdates → message.chat.id). Остальное — интервалы в минутах.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://portal-api:8000/api/v1/health",
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "name": "GET /api/v1/health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Проверка Portal API. Дополняет Uptime Kuma: дёшево и в том же чате.\n// Шлём одно сообщение при падении, повтор каждые 30 минут пока лежит, и одно — при восстановлении.\nconst P = $('Параметры').first().json;\nif (!P.chat_id || String(P.chat_id).includes('REPLACE')) throw new Error('Параметры → chat_id не задан');\nconst r = $input.first().json;\nconst ok = !r.error && Number(r.statusCode) === 200 && r.body && r.body.status === 'ok';\nconst store = $getWorkflowStaticData('global');\nconst now = Date.now();\nconst out = [];\nif (!ok) {\n  const reason = r.error ? (r.error.message || JSON.stringify(r.error)) : `HTTP ${r.statusCode}`;\n  if (!store.downSince) { store.downSince = now; store.lastAlert = now; out.push(msg(`🔴 <b>Portal API не отвечает</b>\\n${esc(reason)}`)); }\n  else if (now - store.lastAlert >= 30 * 60000) { store.lastAlert = now; out.push(msg(`🔴 <b>Portal API всё ещё лежит</b> (${Math.round((now - store.downSince) / 60000)} мин)\\n${esc(reason)}`)); }\n} else if (store.downSince) {\n  out.push(msg(`✅ <b>Portal API снова отвечает</b> (лежал ${Math.round((now - store.downSince) / 60000)} мин)`));\n  delete store.downSince; delete store.lastAlert;\n}\nfunction esc(s) { return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\nfunction msg(text) { return { json: { chat_id: String(P.chat_id), text } }; }\nreturn out;"
+      },
+      "name": "Упало / поднялось",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true,
+          "appendAttribution": false
+        }
+      },
+      "name": "Telegram владельцу",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Каждые 5 минут": {
+      "main": [
+        [
+          {
+            "node": "Параметры",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Параметры": {
+      "main": [
+        [
+          {
+            "node": "GET /api/v1/health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET /api/v1/health": {
+      "main": [
+        [
+          {
+            "node": "Упало / поднялось",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Упало / поднялось": {
+      "main": [
+        [
+          {
+            "node": "Telegram владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Moscow",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "active": false
+}

@@ -1,0 +1,670 @@
+{
+  "name": "Захват из Telegram",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 30
+            }
+          ]
+        }
+      },
+      "name": "Каждые 30 секунд",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "p0",
+              "name": "chat_id",
+              "value": "={{ $env.TELEGRAM_CHAT_ID || 'REPLACE_CHAT_ID' }}",
+              "type": "string"
+            },
+            {
+              "id": "p1",
+              "name": "bot_token_set",
+              "value": "={{ $env.TELEGRAM_BOT_TOKEN ? 'да' : 'нет' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "name": "Параметры",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Откуда читать обновления Telegram: offset живёт в staticData сценария и переживает рестарты.\n// Telegram Trigger (вебхук от Telegram) не подходит — входящих соединений к серверу нет,\n// поэтому опрос getUpdates раз в минуту.\nconst P = $('Параметры').first().json;\nif (!P.chat_id || String(P.chat_id).includes('REPLACE')) throw new Error('Параметры → chat_id не задан (TELEGRAM_CHAT_ID)');\nif (P.bot_token_set !== 'да') throw new Error('TELEGRAM_BOT_TOKEN не задан в окружении n8n — нужен для getUpdates');\nconst store = $getWorkflowStaticData('global');\nreturn [{ json: { offset: Number(store.offset) || 0 } }];\n"
+      },
+      "name": "Смещение из памяти",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/getUpdates",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "offset",
+              "value": "={{ $json.offset }}"
+            },
+            {
+              "name": "timeout",
+              "value": "20"
+            },
+            {
+              "name": "allowed_updates",
+              "value": "[\"message\"]"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "name": "Telegram: getUpdates",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        400
+      ],
+      "notes": "Длинный опрос: интервал сценария 30 с > ожидание 20 с + обработка, иначе два параллельных getUpdates дадут 409. Ошибка ноды роняет прогон без сообщения владельцу — offset не сдвинут, следующий прогон повторит."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Разбор обновлений Telegram. Обрабатываем только чат владельца (TELEGRAM_CHAT_ID), чужое — молча мимо.\n// Offset продвигаем СРАЗУ: даже если команда дальше упадёт, следующий опрос её не повторит (иначе — цикл).\nconst P = $('Параметры').first().json;\nconst r = $input.first().json;\nif (!r || r.ok !== true) throw new Error('getUpdates: ' + JSON.stringify(r).slice(0, 300));\nconst updates = Array.isArray(r.result) ? r.result : [];\nconst store = $getWorkflowStaticData('global');\nif (updates.length) store.offset = Math.max(...updates.map((u) => Number(u.update_id))) + 1;\n\nconst HELP = [\n  'Команды:',\n  '/task <текст> [@ <срок>] — задача в Todoist («Обязательства»); срок по-русски: @ завтра 12:00, без срока — сегодня 20:00',\n  '/lead <текст> — лид в EspoCRM (источник telegram)',\n  'любой другой текст — элемент ленты портала (source manual)',\n].join('\\n');\nconst cut = (s, n) => String(s ?? '').slice(0, n);\nconst nowEspo = DateTime.utc().toFormat('yyyy-LL-dd HH:mm:ss');\n\n// Ссылка на сообщение: для супергрупп/каналов — t.me/c/…, для пересланного поста канала — его адрес,\n// для личного чата с ботом ссылки нет → https://t.me/ (контракт требует url).\nfunction messageUrl(m) {\n  const c = m.chat || {};\n  if (c.username) return `https://t.me/${c.username}/${m.message_id}`;\n  const id = String(c.id);\n  if (id.startsWith('-100')) return `https://t.me/c/${id.slice(4)}/${m.message_id}`;\n  const fo = m.forward_origin;\n  if (fo && fo.type === 'channel' && fo.chat && fo.chat.username && fo.message_id) {\n    return `https://t.me/${fo.chat.username}/${fo.message_id}`;\n  }\n  return 'https://t.me/';\n}\n\nconst out = [];\nconst push = (base, extra) => out.push({ json: Object.assign({}, base, extra) });\nfor (const u of updates) {\n  const m = u.message;\n  if (!m || !m.chat || String(m.chat.id) !== String(P.chat_id)) continue;\n  const text = String(m.text ?? m.caption ?? '').trim();\n  if (!text) continue;\n  const base = {\n    chat_id: String(P.chat_id), update_id: u.update_id,\n    project_id: store.todoist_project_id ? String(store.todoist_project_id) : '',\n  };\n  const cmd = /^\\/([a-zA-Z_]+)(?:@\\w+)?(?:\\s+([\\s\\S]*))?$/.exec(text);\n  const name = cmd ? cmd[1].toLowerCase() : null;\n  const arg = cmd ? (cmd[2] || '').trim() : '';\n\n  if (name === 'start' || name === 'help') {\n    push(base, { kind: 'reply', what: 'справка', ok_text: HELP });\n  } else if (name === 'task') {\n    if (!arg) { push(base, { kind: 'reply', what: 'задача', ok_text: '✗ /task: нужен текст. Пример: /task Позвонить Иванову @ завтра 12:00' }); continue; }\n    const at = /^([\\s\\S]*?)\\s+@\\s*(.+)$/.exec(arg); // срок — после последнего « @ »\n    const content = (at ? at[1] : arg).trim();\n    const due = at ? at[2].trim() : 'сегодня 20:00';\n    push(base, { kind: 'task', what: 'задача', ok_text: `✓ задача: ${content} (срок: ${due})`,\n      body: { content, due_string: due, due_lang: 'ru' } });\n  } else if (name === 'lead') {\n    if (!arg) { push(base, { kind: 'reply', what: 'лид', ok_text: '✗ /lead: нужен текст. Пример: /lead Иван, бот для записи, 30 000 ₽' }); continue; }\n    push(base, { kind: 'lead', what: 'лид', ok_text: `✓ лид: ${cut(arg, 100)}`,\n      body: { lastName: cut(arg, 100), description: arg, status: 'responded', source: 'telegram', cRespondedAt: nowEspo } });\n  } else if (name) {\n    push(base, { kind: 'reply', what: 'команда', ok_text: `✗ неизвестная команда /${name}\\n\\n${HELP}` });\n  } else {\n    const title = cut(text.split('\\n')[0].trim(), 80) || cut(text, 80);\n    push(base, { kind: 'feed', what: 'лента', ok_text: `✓ в ленте: ${title}`,\n      body: {\n        schema_version: 1, source: 'manual', external_id: `tg-${u.update_id}`, title,\n        url: messageUrl(m),\n        published_at: DateTime.fromSeconds(Number(m.date) || Date.now() / 1000).toUTC().toISO(),\n        text: cut(text, 20000),\n      } });\n  }\n}\nreturn out; // 0 элементов → дальше ничего не выполняется\n"
+      },
+      "name": "Разбор сообщений",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c1",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "task",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "task"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c1",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "lead",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "lead"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c1",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "feed",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "feed"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c1",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "reply",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "reply"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Что это?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1200,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.project_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Проект известен?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1440,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "p0",
+              "name": "project_id",
+              "value": "={{ $json.project_id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "name": "Проект из кэша",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.todoist.com/api/v1/projects",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Todoist: проекты",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        240
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "// Ищем проект «Обязательства» по имени и кэшируем id в staticData — следующие команды список не запрашивают.\nconst j = $input.item.json;\nconst list = Array.isArray(j) ? j : (Array.isArray(j.results) ? j.results : []);\nconst p = list.find((x) => String(x.name || '').trim().toLowerCase() === 'обязательства');\nif (!p) throw new Error('в Todoist нет проекта «Обязательства» (есть: ' + list.map((x) => x.name).join(', ') + ')');\nconst store = $getWorkflowStaticData('global');\nstore.todoist_project_id = String(p.id);\nreturn { json: { project_id: String(p.id) } };\n"
+      },
+      "name": "Проект «Обязательства»",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        240
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.todoist.com/api/v1/tasks",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify(Object.assign({}, $('Разбор сообщений').item.json.body, { project_id: String($json.project_id) })) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Todoist: создать задачу",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2160,
+        120
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ESPO_URL }}/api/v1/Lead",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{ $env.N8N_ESPO_API_KEY }}"
+            },
+            {
+              "name": "X-Skip-Duplicate-Check",
+              "value": "true"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Разбор сообщений').item.json.body) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Espo: создать лид",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        480
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PORTAL_API_URL }}/api/v1/feed/items",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Portal-Token",
+              "value": "={{ $env.PORTAL_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Разбор сообщений').item.json.body) }}",
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "name": "Портал: в ленту",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        680
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "// Итог для владельца: успех → готовый текст из разбора, ошибка → её причина.\n// Offset уже продвинут в «Разбор сообщений», поэтому сбой одной команды опрос не зациклит.\n// Текст ошибки: n8n кладёт её в json.error строкой или объектом {message, description}.\nfunction errText(e) {\n  if (e === null || e === undefined) return 'неизвестная ошибка';\n  if (typeof e === 'string') return e;\n  const parts = [e.message, e.description].filter(Boolean);\n  return parts.length ? parts.join(' — ') : JSON.stringify(e);\n}\nconst src = $('Разбор сообщений').item.json;\nconst e = $json.error;\nlet text;\nif (e !== undefined) {\n  text = `✗ ${src.what}: ${errText(e)}`;\n  // Задача не создалась — возможно, проект пересоздан: сбрасываем кэш, следующая команда найдёт его заново.\n  if (src.kind === 'task') { try { delete $getWorkflowStaticData('global').todoist_project_id; } catch (_) { /* не критично */ } }\n} else if (src.kind === 'feed' && Number($json.statusCode) === 200) {\n  text = src.ok_text + ' (уже было)'; // 200 — дубль по (source, external_id), 201 — новый\n} else {\n  text = src.ok_text;\n}\nreturn { json: { chat_id: src.chat_id, text } };\n"
+      },
+      "name": "Ответ владельцу",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ String($json.text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "name": "Telegram: ответ",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2640,
+        480
+      ]
+    }
+  ],
+  "connections": {
+    "Параметры": {
+      "main": [
+        [
+          {
+            "node": "Смещение из памяти",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Смещение из памяти": {
+      "main": [
+        [
+          {
+            "node": "Telegram: getUpdates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram: getUpdates": {
+      "main": [
+        [
+          {
+            "node": "Разбор сообщений",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Разбор сообщений": {
+      "main": [
+        [
+          {
+            "node": "Что это?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Что это?": {
+      "main": [
+        [
+          {
+            "node": "Проект известен?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Espo: создать лид",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Портал: в ленту",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ответ владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Проект известен?": {
+      "main": [
+        [
+          {
+            "node": "Проект из кэша",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Todoist: проекты",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Проект из кэша": {
+      "main": [
+        [
+          {
+            "node": "Todoist: создать задачу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Todoist: проекты": {
+      "main": [
+        [
+          {
+            "node": "Проект «Обязательства»",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ответ владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Проект «Обязательства»": {
+      "main": [
+        [
+          {
+            "node": "Todoist: создать задачу",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ответ владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Todoist: создать задачу": {
+      "main": [
+        [
+          {
+            "node": "Ответ владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ответ владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Espo: создать лид": {
+      "main": [
+        [
+          {
+            "node": "Ответ владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ответ владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Портал: в ленту": {
+      "main": [
+        [
+          {
+            "node": "Ответ владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ответ владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ответ владельцу": {
+      "main": [
+        [
+          {
+            "node": "Telegram: ответ",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Каждые 30 секунд": {
+      "main": [
+        [
+          {
+            "node": "Параметры",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Moscow",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "active": false
+}

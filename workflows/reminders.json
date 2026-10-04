@@ -1,0 +1,337 @@
+{
+  "name": "Напоминания с последствием",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "name": "Каждые 5 минут",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "p0",
+              "name": "chat_id",
+              "value": "={{ $env.TELEGRAM_CHAT_ID || 'REPLACE_CHAT_ID' }}",
+              "type": "string"
+            },
+            {
+              "id": "p1",
+              "name": "lookahead_min",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "p2",
+              "name": "stage1_min",
+              "value": 60,
+              "type": "number"
+            },
+            {
+              "id": "p3",
+              "name": "stage2_min",
+              "value": 120,
+              "type": "number"
+            },
+            {
+              "id": "p4",
+              "name": "repeat_min",
+              "value": 60,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Параметры",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "ЗАМЕНИТЬ ПРИ ИМПОРТЕ: chat_id — твой личный чат с ботом (узнать: написать боту, затем GET https://api.telegram.org/bot<token>/getUpdates → message.chat.id). Остальное — интервалы в минутах.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.todoist.com/api/v1/projects",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendQuery": false,
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Todoist: проекты",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.todoist.com/api/v1/tasks",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "200"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Todoist: открытые задачи",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Отбор задач со сроком и расчёт ступени эскалации.\n//\n// Почему дедупликация — в $getWorkflowStaticData, а не во внешней БД:\n// у нас нет другого хранилища, доступного n8n без новых компонентов, а нужен\n// всего один маленький словарь {taskId: {lastStage, lastSentAt, dueMs, title, consequence}}\n//.\n// Статичные данные живут в записи workflow в БД n8n и переживают рестарты.\n// Ограничение: они сохраняются только у активного workflow (production-запуски);\n// при ручном «Test workflow» словарь не пишется — это нормально для проверки.\nconst P = $('Параметры').first().json;\nif (!P.chat_id || String(P.chat_id).includes('REPLACE')) {\n  throw new Error('Параметры → chat_id не задан: замени REPLACE_CHAT_ID на свой chat_id');\n}\nconst lookaheadMs = Number(P.lookahead_min) * 60000;\nconst stage1Ms = Number(P.stage1_min) * 60000;\nconst stage2Ms = Number(P.stage2_min) * 60000;\nconst repeatMs = Number(P.repeat_min) * 60000;\nconst TZ = 'Europe/Moscow';\n\nconst unwrap = (j) => Array.isArray(j) ? j : (Array.isArray(j.results) ? j.results : (Array.isArray(j.items) ? j.items : []));\nconst tasks = $input.all().flatMap((i) => unwrap(i.json));\nconst projects = {};\nfor (const p of $('Todoist: проекты').all().flatMap((i) => unwrap(i.json))) projects[String(p.id)] = p.name;\n\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\n// Срок → миллисекунды UTC. Только дата → 23:59 по Москве (как в адаптере Portal).\nfunction dueMs(due) {\n  if (!due) return null;\n  // Todoist API v1 кладёт дату-время в due.date («2026-09-20T11:53:05Z»); поля due.datetime нет.\n  // Отличаем по \"T\": со временем — момент, без времени — весь день (конец дня по Москве).\n  const raw = String(due.datetime || due.date || '');\n  if (!raw) return null;\n  if (raw.includes('T')) {\n    if (/[zZ]|[+-]\\d\\d:?\\d\\d$/.test(raw)) return DateTime.fromISO(raw).toMillis();\n    return DateTime.fromISO(raw, { zone: due.timezone || TZ }).toMillis();\n  }\n  return DateTime.fromISO(raw, { zone: TZ }).set({ hour: 23, minute: 59 }).toMillis();\n}\n\nconst nowMs = Date.now();\nconst nowIso = new Date(nowMs).toISOString(); // ts событий для портала\nconst store = $getWorkflowStaticData('global');\nstore.sent = store.sent || {};\nconst seen = new Set();\nconst out = [];\n\nfor (const t of tasks) {\n  const id = String(t.id);\n  seen.add(id);\n  if (t.is_completed || t.checked) continue;\n  const due = dueMs(t.due);\n  if (due === null || due > nowMs + lookaheadMs) continue;\n\n  const overdueMs = nowMs - due;\n  const stage = overdueMs >= stage2Ms ? 2 : overdueMs >= stage1Ms ? 1 : 0;\n\n  const prev = store.sent[id];\n  const rescheduled = prev && prev.dueMs !== due; // срок перенесли — считаем задачу новой\n  let send = false;\n  if (!prev || rescheduled) send = true;\n  else if (stage > prev.lastStage) send = true;\n  else if (stage === 2 && nowMs - prev.lastSentAt >= repeatMs) send = true; // на 2-й ступени — каждый час\n  if (!send) continue;\n\n  const m = /последствие\\s*[:—-]\\s*(.+)/i.exec(t.description || '');\n  const consequence = m ? m[1].trim() : null;\n  const project = projects[String(t.project_id)] || '';\n  const dueText = DateTime.fromMillis(due).setZone(TZ).toFormat('dd.MM HH:mm');\n  const url = t.url || `https://app.todoist.com/app/task/${id}`;\n\n  const header = stage === 0 ? '⏰ <b>Срок</b>'\n    : stage === 1 ? '⏰⏰ <b>Час просрочки</b>'\n    : '🔴🔴🔴 <b>ДВА ЧАСА ПРОСРОЧКИ</b>';\n  const consLine = consequence\n    ? (stage === 2 ? `<b>ПОСЛЕДСТВИЕ: ${esc(consequence).toUpperCase()}</b>` : `<b>Последствие:</b> ${esc(consequence)}`)\n    : '⚠ <i>последствие не указано</i>';\n\n  const text = [\n    header,\n    `<b>${esc(t.content)}</b>`,\n    [project ? `📁 ${esc(project)}` : null, `🕒 ${dueText} МСК`].filter(Boolean).join(' · '),\n    consLine,\n    `<a href=\"${esc(url)}\">открыть задачу</a>`,\n  ].join('\\n');\n\n  // Событие в портал: первая ступень — «sent», остальные (и часовые повторы) — «escalated».\n  const event = { task_id: id, stage, kind: stage === 0 ? 'sent' : 'escalated', ts: nowIso, task_title: t.content, consequence };\n  out.push({ json: { notify: true, chat_id: String(P.chat_id), text, task_id: id, stage, event } });\n  store.sent[id] = { lastStage: stage, lastSentAt: nowMs, dueMs: due, title: t.content, consequence };\n}\n\n// Задачи, которых больше нет в выдаче (закрыты/удалены): одно событие «closed» в портал и забыть —\n// эскалация останавливается. Событие уходит ровно один раз: запись удаляется из словаря в этом же прогоне,\n// а в Telegram такие элементы не идут (notify: false → IF «Есть сообщение?»).\nfor (const id of Object.keys(store.sent)) {\n  if (seen.has(id)) continue;\n  const prev = store.sent[id] || {};\n  const stage = Number(prev.lastStage) || 0;\n  out.push({ json: { notify: false, task_id: id, stage, event: {\n    task_id: id, stage, kind: 'closed', ts: nowIso,\n    task_title: prev.title || '(без названия)', consequence: prev.consequence ?? null,\n  } } });\n  delete store.sent[id];\n}\n\nreturn out; // 0 элементов → дальше ничего не выполняется"
+      },
+      "name": "Отбор и ступени эскалации",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true,
+          "appendAttribution": false
+        }
+      },
+      "name": "Telegram владельцу",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1440,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {},
+        "looseTypeValidation": true
+      },
+      "name": "Есть сообщение?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PORTAL_API_URL }}/api/v1/reminders/events",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Portal-Token",
+              "value": "={{ $env.PORTAL_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Отбор и ступени эскалации').item.json.event) }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "name": "Портал: событие напоминания",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "kind = sent (ступень 0) / escalated (1–2) / closed (задача пропала из открытых). Сбой не ломает напоминание — оно уже отправлено.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Событие в портал — вспомогательное: его сбой не должен ломать напоминание, поэтому у HTTP-ноды\n// continueOnFail, а здесь только фиксируем причину — в лог n8n и в данные выполнения.\nconst out = [];\nfor (const item of $input.all()) {\n  const e = item.json.error;\n  if (e === undefined) continue;\n  const msg = typeof e === 'string' ? e : [e && e.message, e && e.description].filter(Boolean).join(' — ') || JSON.stringify(e);\n  console.log('reminders/events не принят порталом: ' + msg);\n  out.push({ json: { event_error: msg } });\n}\nreturn out;\n"
+      },
+      "name": "Ошибка события — в лог",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Каждые 5 минут": {
+      "main": [
+        [
+          {
+            "node": "Параметры",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Параметры": {
+      "main": [
+        [
+          {
+            "node": "Todoist: проекты",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Todoist: проекты": {
+      "main": [
+        [
+          {
+            "node": "Todoist: открытые задачи",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Todoist: открытые задачи": {
+      "main": [
+        [
+          {
+            "node": "Отбор и ступени эскалации",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Отбор и ступени эскалации": {
+      "main": [
+        [
+          {
+            "node": "Есть сообщение?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Есть сообщение?": {
+      "main": [
+        [
+          {
+            "node": "Telegram владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Портал: событие напоминания",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram владельцу": {
+      "main": [
+        [
+          {
+            "node": "Портал: событие напоминания",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Портал: событие напоминания": {
+      "main": [
+        [
+          {
+            "node": "Ошибка события — в лог",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Moscow",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "active": false
+}

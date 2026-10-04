@@ -1,0 +1,494 @@
+{
+  "name": "Отклик → лид и задача",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "feed.responded",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "name": "Вебхук от портала",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Портал вызывает POST http://n8n:5678/webhook/feed-responded при действии «Откликнулся». Тело = элемент ленты + id, status, note. Ответ 200 сразу, работа — асинхронно.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Разбор вебхука «Откликнулся» от портала: проверяем поля контракта feed-item v1\n// и готовим тела запросов для Espo и Todoist. Один вебхук — один элемент.\n// Секретов здесь нет: адреса и ключи подставляют HTTP-ноды из $env.\nconst raw = $input.first().json.body || {};\n// Адаптер портала шлёт {event, payload, emitted_at}; на всякий случай принимаем и плоское тело.\nconst b = raw.payload && typeof raw.payload === 'object' ? raw.payload : raw;\nconst required = ['external_id', 'title', 'url', 'text', 'source'];\nconst missing = required.filter((k) => b[k] === undefined || b[k] === null || b[k] === '');\nif (missing.length) throw new Error('в теле вебхука нет полей: ' + missing.join(', '));\n\nconst ESPO_SOURCES = ['kc', 'kwork', 'fl', 'hh', 'workspace', 'telegram', 'manual']; // остальное → other\nconst cut = (s, n) => String(s ?? '').slice(0, n);\n// Даты для Espo — «YYYY-MM-DD HH:mm:ss» в UTC (так хранит сам Espo).\nconst espoDate = (iso) => {\n  if (!iso) return null;\n  const d = DateTime.fromISO(String(iso));\n  return d.isValid ? d.toUTC().toFormat('yyyy-LL-dd HH:mm:ss') : null;\n};\n// Бюджет из объекта контракта в строку ≤ 60 символов (поле cBudget — varchar(60)).\nfunction budgetText(bd) {\n  if (!bd || typeof bd !== 'object') return null;\n  const cur = bd.currency || 'RUB';\n  const has = (v) => v !== undefined && v !== null;\n  let s = null;\n  if (has(bd.min) && has(bd.max) && bd.min !== bd.max) s = `${bd.min}–${bd.max} ${cur}`;\n  else if (has(bd.max) || has(bd.min)) s = `${has(bd.max) ? bd.max : bd.min} ${cur}`;\n  else if (bd.kind && bd.kind !== 'unknown') s = bd.kind;\n  if (s && bd.kind === 'hourly') s += '/ч';\n  return s ? cut(s, 60) : null;\n}\n\nconst consequence = (b.note && String(b.note).trim()) || 'нет ответа — заказ уйдёт другому';\nconst externalId = cut(b.external_id, 100); // в Espo поле cExternalId — varchar(100); дедуп по нему же\n\nconst lead = {\n  lastName: cut(b.title, 100),\n  description: String(b.text),\n  status: 'responded',\n  source: ESPO_SOURCES.includes(b.source) ? b.source : 'other',\n  cSourceUrl: String(b.url),\n  cExternalId: externalId,\n  cPublishedAt: espoDate(b.published_at),\n  cBudget: budgetText(b.budget),\n  cConsequence: consequence,\n  cRespondedAt: DateTime.utc().toFormat('yyyy-LL-dd HH:mm:ss'),\n};\n// Задача follow-up: «Последствие: …» в описании подхватывает сценарий напоминаний.\nconst task = {\n  content: 'Follow-up: ' + cut(b.title, 200),\n  description: 'Последствие: ' + consequence + '\\n' + String(b.url),\n  due_string: 'tomorrow 10:00',\n  due_lang: 'en',\n};\n// id проекта «Обязательства» кэшируется в staticData после первого поиска (нода «Проект «Обязательства»»).\nconst store = $getWorkflowStaticData('global');\nreturn [{ json: {\n  title: String(b.title), external_id: externalId, feed_id: b.id ?? null,\n  lead, task, project_id: store.todoist_project_id ? String(store.todoist_project_id) : '',\n} }];\n"
+      },
+      "name": "Разбор вебхука",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.ESPO_URL }}/api/v1/Lead",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "where[0][type]",
+              "value": "equals"
+            },
+            {
+              "name": "where[0][attribute]",
+              "value": "cExternalId"
+            },
+            {
+              "name": "where[0][value]",
+              "value": "={{ $json.external_id }}"
+            },
+            {
+              "name": "maxSize",
+              "value": "1"
+            },
+            {
+              "name": "select",
+              "value": "id"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{ $env.N8N_ESPO_API_KEY }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Espo: поиск дубля",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ Number($json.total || 0) }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {},
+        "looseTypeValidation": true
+      },
+      "name": "Лид уже есть?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        300
+      ]
+    },
+    {
+      "parameters": {},
+      "name": "Дубль — ничего не делаем",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        960,
+        120
+      ],
+      "notes": "Повторный вебхук с тем же external_id: ни лида, ни задачи.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ESPO_URL }}/api/v1/Lead",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{ $env.N8N_ESPO_API_KEY }}"
+            },
+            {
+              "name": "X-Skip-Duplicate-Check",
+              "value": "true"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Разбор вебхука').first().json.lead) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Espo: создать лид",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        380
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $('Разбор вебхука').first().json.project_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Проект известен?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1200,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "p0",
+              "name": "project_id",
+              "value": "={{ $('Разбор вебхука').first().json.project_id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "name": "Проект из кэша",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1440,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.todoist.com/api/v1/projects",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Todoist: проекты",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        500
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Ищем проект «Обязательства» по имени и кэшируем id в staticData — дальше список не запрашиваем.\nconst unwrap = (j) => Array.isArray(j) ? j : (Array.isArray(j.results) ? j.results : []);\nconst list = $input.all().flatMap((i) => unwrap(i.json));\nconst p = list.find((x) => String(x.name || '').trim().toLowerCase() === 'обязательства');\nif (!p) throw new Error('в Todoist нет проекта «Обязательства» (есть: ' + list.map((x) => x.name).join(', ') + ')');\nconst store = $getWorkflowStaticData('global');\nstore.todoist_project_id = String(p.id);\nreturn [{ json: { project_id: String(p.id) } }];\n"
+      },
+      "name": "Проект «Обязательства»",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        500
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.todoist.com/api/v1/tasks",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify(Object.assign({}, $('Разбор вебхука').first().json.task, { project_id: String($json.project_id) })) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Todoist: создать задачу",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        380
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Одно сообщение владельцу на любую ошибку сценария.\n// Заголовок берём из самого вебхука — нода «Разбор вебхука» могла упасть сама.\n// Текст ошибки: n8n кладёт её в json.error строкой или объектом {message, description}.\nfunction errText(e) {\n  if (e === null || e === undefined) return 'неизвестная ошибка';\n  if (typeof e === 'string') return e;\n  const parts = [e.message, e.description].filter(Boolean);\n  return parts.length ? parts.join(' — ') : JSON.stringify(e);\n}\nlet title = '?';\ntry { const rb = $('Вебхук от портала').first().json.body || {}; title = String((rb.payload || rb).title || '?'); } catch (_) { /* тела нет */ }\n// Кэш проекта Todoist сбрасываем: если проект пересоздали, следующий вебхук найдёт его заново.\ntry { delete $getWorkflowStaticData('global').todoist_project_id; } catch (_) { /* не критично */ }\nreturn [{ json: { text: `⚠ Лента: не удалось создать лид/задачу для ${title}: ${errText($json.error)}` } }];\n"
+      },
+      "name": "Текст ошибки",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ String($json.text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "name": "Telegram владельцу",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2160,
+        760
+      ]
+    }
+  ],
+  "connections": {
+    "Вебхук от портала": {
+      "main": [
+        [
+          {
+            "node": "Разбор вебхука",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Разбор вебхука": {
+      "main": [
+        [
+          {
+            "node": "Espo: поиск дубля",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Текст ошибки",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Espo: поиск дубля": {
+      "main": [
+        [
+          {
+            "node": "Лид уже есть?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Текст ошибки",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Лид уже есть?": {
+      "main": [
+        [
+          {
+            "node": "Дубль — ничего не делаем",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Espo: создать лид",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Espo: создать лид": {
+      "main": [
+        [
+          {
+            "node": "Проект известен?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Текст ошибки",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Проект известен?": {
+      "main": [
+        [
+          {
+            "node": "Проект из кэша",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Todoist: проекты",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Проект из кэша": {
+      "main": [
+        [
+          {
+            "node": "Todoist: создать задачу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Todoist: проекты": {
+      "main": [
+        [
+          {
+            "node": "Проект «Обязательства»",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Текст ошибки",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Проект «Обязательства»": {
+      "main": [
+        [
+          {
+            "node": "Todoist: создать задачу",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Текст ошибки",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Todoist: создать задачу": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Текст ошибки",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Текст ошибки": {
+      "main": [
+        [
+          {
+            "node": "Telegram владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Moscow",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "active": false
+}

@@ -1,0 +1,489 @@
+{
+  "name": "Черновик отчёта руководителю",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "weeksInterval": 1,
+              "triggerAtDay": [
+                0
+              ],
+              "triggerAtHour": 20,
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "name": "Воскресенье 20:30",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Время по Europe/Moscow (settings.timezone сценария)."
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "p0",
+              "name": "chat_id",
+              "value": "={{ $env.TELEGRAM_CHAT_ID || 'REPLACE_CHAT_ID' }}",
+              "type": "string"
+            },
+            {
+              "id": "p1",
+              "name": "model",
+              "value": "yandexgpt",
+              "type": "string"
+            },
+            {
+              "id": "p2",
+              "name": "monthly_token_cap",
+              "value": 200000,
+              "type": "number"
+            },
+            {
+              "id": "p3",
+              "name": "week_start_utc",
+              "value": "={{ $now.setZone('Europe/Moscow').startOf('week').toUTC().toFormat('yyyy-MM-dd HH:mm:ss') }}",
+              "type": "string"
+            },
+            {
+              "id": "p4",
+              "name": "week_label",
+              "value": "={{ $now.setZone('Europe/Moscow').startOf('week').toFormat('dd.MM') }}–{{ $now.setZone('Europe/Moscow').endOf('week').toFormat('dd.MM') }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "Параметры",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "model — по прогону: yandexgpt для отчёта; yandexgpt-lite — дешёвый запасной. monthly_token_cap — потолок токенов в месяц: при превышении вызовов нет, только сообщение.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.PORTAL_API_URL || 'http://portal-api:8000' }}/api/v1/kpi/week",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "name": "Портал: KPI недели",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.ESPO_URL || 'http://espocrm:80' }}/api/v1/Lead",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "select",
+              "value": "status,source,createdAt,cRespondedAt,cBudget"
+            },
+            {
+              "name": "maxSize",
+              "value": "200"
+            },
+            {
+              "name": "orderBy",
+              "value": "createdAt"
+            },
+            {
+              "name": "where[0][type]",
+              "value": "after"
+            },
+            {
+              "name": "where[0][attribute]",
+              "value": "createdAt"
+            },
+            {
+              "name": "where[0][value]",
+              "value": "={{ $('Параметры').first().json.week_start_utc }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{ $env.N8N_ESPO_API_KEY }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "name": "Espo: отклики недели",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "select — только статус, источник, даты, бюджет. Имена, описания, телефоны, e-mail НЕ запрашиваются."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Сбор данных и ОБЕЗЛИЧИВАНИЕ запроса к провайдеру.\n// На вход: ответ Espo (fullResponse); KPI берём из ноды «Портал: KPI недели».\n// На выход — один элемент: { ok, error, body, week_label, removed, model }.\nconst P = $('Параметры').first().json;\nif (!P.chat_id || String(P.chat_id).includes('REPLACE')) {\n  return [{ json: { ok: false, error: 'Параметры → chat_id не задан (TELEGRAM_CHAT_ID)' } }];\n}\nconst fail = (error) => [{ json: { ok: false, error, week_label: P.week_label } }];\n\n// --- Портал: KPI недели\nconst kpiResp = $('Портал: KPI недели').first().json;\nif (kpiResp.error || Number(kpiResp.statusCode) !== 200 || !kpiResp.body || !Array.isArray(kpiResp.body.metrics)) {\n  const why = kpiResp.error ? (kpiResp.error.message || JSON.stringify(kpiResp.error)) : `HTTP ${kpiResp.statusCode}`;\n  return fail(`Портал не отдал KPI недели (${why})`);\n}\nconst kpi = kpiResp.body;\n\n// --- Espo: отклики недели. Берём ТОЛЬКО статус, источник, даты и бюджет — имён/контактов в запросе нет.\nconst espoResp = $input.first().json;\nif (espoResp.error || Number(espoResp.statusCode) !== 200 || !espoResp.body) {\n  const why = espoResp.error ? (espoResp.error.message || JSON.stringify(espoResp.error)) : `HTTP ${espoResp.statusCode}`;\n  return fail(`Espo не отдал отклики недели (${why})`);\n}\nconst leads = Array.isArray(espoResp.body.list) ? espoResp.body.list : [];\n\n// --- Месячный потолок токенов: считаем в staticData, при превышении — не вызываем провайдера.\nconst store = $getWorkflowStaticData('global');\nstore.usage = store.usage || {};\nconst month = DateTime.now().setZone('Europe/Moscow').toFormat('yyyy-MM');\nconst spent = Number(store.usage[month] || 0);\nconst cap = Number(P.monthly_token_cap || 0);\nif (cap > 0 && spent >= cap) {\n  return fail(`месячный потолок токенов исчерпан (${spent} из ${cap}); поднять monthly_token_cap в Параметрах`);\n}\n\n// --- Сводка по откликам: по площадкам, статусам, скорости ответа и бюджетам\nconst bySource = {};\nlet responded24 = 0, respondedTotal = 0;\nfor (const l of leads) {\n  const s = l.source || 'other';\n  const b = bySource[s] = bySource[s] || { n: 0, statuses: {}, budgets: [] };\n  b.n += 1;\n  const st = l.status || '—';\n  b.statuses[st] = (b.statuses[st] || 0) + 1;\n  if (l.cBudget) b.budgets.push(String(l.cBudget));\n  if (l.cRespondedAt && l.createdAt) {\n    respondedTotal += 1;\n    const h = (Date.parse(l.cRespondedAt.replace(' ', 'T') + 'Z') - Date.parse(l.createdAt.replace(' ', 'T') + 'Z')) / 3600000;\n    if (h >= 0 && h <= 24) responded24 += 1;\n  }\n}\nconst srcLines = Object.entries(bySource).map(([s, b]) => {\n  const st = Object.entries(b.statuses).map(([k, v]) => `${k} ${v}`).join(', ');\n  const bud = b.budgets.length ? `; бюджеты: ${b.budgets.slice(0, 5).join(', ')}` : '';\n  return `- ${s}: ${b.n} (статусы: ${st}${bud})`;\n});\n\nconst metricLines = kpi.metrics.map((m) => {\n  const goal = m.target != null ? ` из ${m.target}` : '';\n  const okTxt = m.ok === true ? ' — цель достигнута' : m.ok === false ? ' — цель не достигнута' : '';\n  return `- ${m.title}: ${m.value}${goal}${okTxt}${m.detail && m.target == null ? ` (${m.detail})` : ''}`;\n});\n\nlet userText = [\n  `Неделя: ${P.week_label}.`,\n  'KPI (из портала):', ...metricLines,\n  `Отклики из CRM за неделю: ${leads.length}${respondedTotal ? `; ответ клиенту дан по ${respondedTotal}, из них в первые 24 ч — ${responded24}` : ''}.`,\n  'По площадкам:', ...(srcLines.length ? srcLines : ['- откликов нет']),\n].join('\\n');\n\n// --- Обезличивание: телефоны, e-mail, ИНН вырезаем регулярными выражениями (в тексте их быть не должно,\n// но бюджет — свободное поле, а KPI detail — строка: страхуемся).\nconst PII = [\n  /\\+?\\d[\\d\\s\\-()]{9,}\\d/g,             // телефон\n  /[\\w.+-]+@[\\w-]+\\.[\\w.-]+/g,           // e-mail\n  /\\b\\d{10}(\\d{2})?\\b/g,                 // ИНН 10/12 цифр\n];\nlet removed = 0;\nfor (const re of PII) userText = userText.replace(re, () => { removed += 1; return '<вырезано>'; });\nif (removed > 0) userText += `\\n(вырезано: ${removed} фрагментов)`;\n\nconst systemText = 'Ты помогаешь фрилансеру-автоматизатору написать недельный отчёт руководителю компании. '\n  + 'Пиши коротко, по-русски, 6–10 строк, деловым тоном от первого лица. Используй только факты из переданных данных, '\n  + 'ничего не выдумывай и не добавляй рекомендаций, которых нет в данных. '\n  + 'Формат: заголовок «Отчёт за неделю ДД.ММ–ДД.ММ», затем строки по метрикам и откликам, затем одна строка '\n  + '«Фокус на следующую неделю» — только если в данных есть невыполненная цель.';\n\nconst folder = $env.YANDEX_FOLDER_ID;\nif (!folder) return fail('YANDEX_FOLDER_ID не задан в окружении n8n');\nconst body = {\n  modelUri: `gpt://${folder}/${P.model}/latest`,\n  completionOptions: { stream: false, temperature: 0.2, maxTokens: '1500' },\n  messages: [{ role: 'system', text: systemText }, { role: 'user', text: userText }],\n};\nreturn [{ json: { ok: true, body, week_label: P.week_label, removed, model: P.model, prompt_chars: userText.length } }];\n"
+      },
+      "name": "Обезличивание",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Данные собраны?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Api-Key {{ $env.YANDEX_API_KEY }}"
+            },
+            {
+              "name": "x-folder-id",
+              "value": "={{ $env.YANDEX_FOLDER_ID }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "name": "Яндекс: черновик",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Прямой маршрут с IP сервера, без прокси. Ключ — из окружения n8n, в JSON его нет."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Разбор ответа Яндекса, учёт usage, текст для Telegram.\nconst P = $('Параметры').first().json;\nconst req = $('Обезличивание').first().json;\nconst r = $input.first().json;\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\nif (r.error || Number(r.statusCode) !== 200) {\n  const why = r.error ? (r.error.message || JSON.stringify(r.error))\n    : `HTTP ${r.statusCode}${r.body && r.body.error ? ': ' + (r.body.error.message || r.body.error) : ''}`;\n  return [{ json: { ok: false, error: `провайдер ИИ (${req.model}) — ${why}` } }];\n}\nconst res = r.body && r.body.result;\nconst alt = res && res.alternatives && res.alternatives[0];\nconst draft = alt && alt.message && alt.message.text ? alt.message.text.trim() : '';\nif (!draft) return [{ json: { ok: false, error: 'провайдер вернул пустой ответ' } }];\n\n// usage → лог сценария и месячный счётчик\nconst usage = (res && res.usage) || {};\nconst total = Number(usage.totalTokens || 0);\nconst store = $getWorkflowStaticData('global');\nstore.usage = store.usage || {};\nconst month = DateTime.now().setZone('Europe/Moscow').toFormat('yyyy-MM');\nstore.usage[month] = Number(store.usage[month] || 0) + total;\nconsole.log(JSON.stringify({ scenario: 'weekly-report', model: req.model, modelVersion: res.modelVersion,\n  inputTextTokens: usage.inputTextTokens, completionTokens: usage.completionTokens, totalTokens: total,\n  month_total: store.usage[month], removed_pii: req.removed }));\n\nconst text = [\n  `📝 <b>Черновик отчёта руководителю</b> (${esc(req.week_label)})`,\n  '',\n  esc(draft),\n  '',\n  `<i>${esc(req.model)} · ${total} токенов · за месяц ${store.usage[month]}${P.monthly_token_cap ? ' из ' + P.monthly_token_cap : ''}`\n    + (req.removed ? ` · вырезано ПДн: ${req.removed}` : '') + '</i>',\n].join('\\n');\nreturn [{ json: { ok: true, chat_id: String(P.chat_id), text } }];\n"
+      },
+      "name": "Разбор ответа и usage",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Черновик получен?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1920,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.text }}",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✅ Готово",
+                    "additionalFields": {
+                      "callback_data": "report:ok"
+                    }
+                  },
+                  {
+                    "text": "✍ Переписать",
+                    "additionalFields": {
+                      "callback_data": "report:redo"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true,
+          "appendAttribution": false
+        }
+      },
+      "name": "Telegram: черновик владельцу",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2160,
+        100
+      ],
+      "notes": "Кнопки только отправляются; callback report:ok / report:redo обработает опрос getUpdates в другом сценарии (см. README)."
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $('Параметры').first().json.chat_id }}",
+        "text": "=⚠ Черновик отчёта не готов: {{ $json.error }}",
+        "additionalFields": {
+          "disable_web_page_preview": true,
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "name": "Telegram: черновик не готов",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2160,
+        420
+      ],
+      "notes": "Любая ошибка (Портал, Espo, провайдер, потолок токенов) — сообщение с причиной, а не тишина."
+    }
+  ],
+  "connections": {
+    "Воскресенье 20:30": {
+      "main": [
+        [
+          {
+            "node": "Параметры",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Параметры": {
+      "main": [
+        [
+          {
+            "node": "Портал: KPI недели",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Портал: KPI недели": {
+      "main": [
+        [
+          {
+            "node": "Espo: отклики недели",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Espo: отклики недели": {
+      "main": [
+        [
+          {
+            "node": "Обезличивание",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Обезличивание": {
+      "main": [
+        [
+          {
+            "node": "Данные собраны?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Данные собраны?": {
+      "main": [
+        [
+          {
+            "node": "Яндекс: черновик",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram: черновик не готов",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Яндекс: черновик": {
+      "main": [
+        [
+          {
+            "node": "Разбор ответа и usage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Разбор ответа и usage": {
+      "main": [
+        [
+          {
+            "node": "Черновик получен?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Черновик получен?": {
+      "main": [
+        [
+          {
+            "node": "Telegram: черновик владельцу",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram: черновик не готов",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Moscow",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "active": false
+}
